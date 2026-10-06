@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.class
+.pytest_cache/
+checkpoints/
+data/
+extracted_features/*.pt
+extracted_features/*.npy
+*.pt
+*.pth
+*.tar.gz
+*.zip
