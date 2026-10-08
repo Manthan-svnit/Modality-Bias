@@ -81,7 +81,16 @@ def train_classifier(
         lr=config.clf_lr,
         weight_decay=config.clf_weight_decay,
     )
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=config.clf_epochs, eta_min=1e-5
+        )
+        if getattr(config, "use_lr_scheduler", True)
+        else None
+    )
 
+    patience = getattr(config, "clf_patience", 20)
+    epochs_no_improve = 0
     best_val_loss = float("inf")
     best_state = None
 
@@ -96,6 +105,9 @@ def train_classifier(
             loss.backward()
             optimizer.step()
 
+        if scheduler is not None:
+            scheduler.step()
+
         classifier.eval()
         val_losses = []
         with torch.no_grad():
@@ -109,7 +121,12 @@ def train_classifier(
         val_loss = float(np.mean(val_losses))
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_no_improve = 0
             best_state = {k: v.cpu().clone() for k, v in classifier.state_dict().items()}
+        else:
+            epochs_no_improve += 1
+            if patience > 0 and epochs_no_improve >= patience:
+                break
 
     if best_state is not None:
         classifier.load_state_dict({k: v.to(device) for k, v in best_state.items()})

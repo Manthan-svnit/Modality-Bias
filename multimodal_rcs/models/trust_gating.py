@@ -1,19 +1,20 @@
 """
 Generalized Modality Trust Gating for N modalities.
 
-Given a list of modality embeddings [z_0, z_1, ..., z_{N-1}], each of shape (B, embed_dim),
-computes per-sample, per-modality softmax trust scores and returns scaled gated embeddings.
+Given a list or arguments of modality embeddings [z_0, z_1, ..., z_{N-1}],
+each of shape (B, embed_dim), computes per-sample, per-modality softmax trust
+scores and returns scaled gated embeddings.
 
-Key generalization over the original 2-modality version:
+Key features:
   - Accepts any number of modalities (N >= 1).
-  - Concatenates all present embeddings, passes through a shared gating MLP,
-    and applies per-modality Softmax normalization.
-  - Scales each modality by N * alpha_i so that when all modalities are equally
-    trusted (1/N each), the magnitude is preserved (analogous to the 2.0 factor
-    in the original 2-modality version).
+  - Supports both list input: gating([z1, z2, ...]) -> (list_of_gated, trust_scores)
+    and positional args: gating(z1, z2, ...) -> (g1, g2, ..., trust_scores).
+  - Scales each modality by N * alpha_i so that uniform trust (1/N)
+    preserves expected embedding magnitude.
 """
 
-from typing import List, Tuple
+from __future__ import annotations
+from typing import List, Tuple, Union, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,11 +29,16 @@ class ModalityTrustGating(nn.Module):
     embedding magnitude when all modalities are equally trusted.
     """
 
-    def __init__(self, num_modalities: int, embed_dim: int = 128, hidden_dim: int = 64):
+    def __init__(
+        self,
+        num_modalities: int = 2,
+        embed_dim: int = 128,
+        hidden_dim: Optional[int] = None,
+    ):
         """
         Args:
             num_modalities : Number of modalities the gating network will handle (N).
-                             Must match the number of embeddings passed to forward().
+                             Defaults to 2 for backward compatibility.
             embed_dim      : Dimensionality of each modality embedding.
             hidden_dim     : Hidden size of the MLP gating network.
         """
@@ -40,6 +46,9 @@ class ModalityTrustGating(nn.Module):
         assert num_modalities >= 1, "num_modalities must be at least 1"
         self.num_modalities = num_modalities
         self.embed_dim = embed_dim
+        if hidden_dim is None:
+            hidden_dim = max(64, embed_dim // 2)
+        self.hidden_dim = hidden_dim
 
         self.gating_network = nn.Sequential(
             nn.Linear(embed_dim * num_modalities, hidden_dim),
@@ -49,17 +58,27 @@ class ModalityTrustGating(nn.Module):
         )
 
     def forward(
-        self, embeddings: List[torch.Tensor]
-    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        self, *args, **kwargs
+    ) -> Union[Tuple[List[torch.Tensor], torch.Tensor], Tuple[torch.Tensor, ...]]:
         """
-        Args:
-            embeddings: List of N tensors, each of shape (B, embed_dim).
-                        All tensors must be on the same device.
+        Supports two invocation signatures:
+          1. List input:
+             gating([z1, z2, ...]) -> (gated_list, trust_scores)
+          2. Multi-argument unpacked input:
+             gating(z1, z2, ...)   -> (g1, g2, ..., trust_scores)
+        """
+        if len(args) == 1 and isinstance(args[0], (list, tuple)):
+            embeddings = list(args[0])
+            is_unpacked_call = False
+        elif len(args) > 0:
+            embeddings = list(args)
+            is_unpacked_call = True
+        elif "embeddings" in kwargs:
+            embeddings = list(kwargs["embeddings"])
+            is_unpacked_call = False
+        else:
+            raise ValueError("ModalityTrustGating expects embeddings as a list or positional arguments.")
 
-        Returns:
-            gated_embeddings : List of N tensors (B, embed_dim) -- trust-weighted embeddings.
-            trust_scores     : FloatTensor (B, N) -- per-sample per-modality trust weights.
-        """
         assert len(embeddings) == self.num_modalities, (
             f"Expected {self.num_modalities} modality embeddings, got {len(embeddings)}"
         )
@@ -71,11 +90,14 @@ class ModalityTrustGating(nn.Module):
         logits = self.gating_network(combined)
         trust_scores = F.softmax(logits, dim=-1)  # (B, N)
 
-        # Scale factor: N * alpha_i so that uniform trust preserves magnitude
+        # Scale factor: N * alpha_i so uniform trust preserves magnitude
         N = float(self.num_modalities)
         gated = []
         for i, z in enumerate(embeddings):
             alpha_i = trust_scores[:, i : i + 1]  # (B, 1)
             gated.append(N * alpha_i * z)
 
+        if is_unpacked_call:
+            # Return tuple compatible with `g_img, g_aud, trust = gating(z_img, z_aud)`
+            return (*gated, trust_scores)
         return gated, trust_scores

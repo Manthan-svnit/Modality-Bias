@@ -2,6 +2,8 @@ from .image_encoder import ImageEncoder
 from .audio_encoder import AudioEncoder
 from .text_encoder import TextEncoder
 from .text_decoder import TextDecoder
+from .video_encoder import VideoEncoder
+from .video_decoder import VideoDecoder
 from .trust_gating import ModalityTrustGating
 from .fusion import CrossAttentionFusion, EarlyFusionModule, LateFusionModule
 from .decoders import ImageDecoder, AudioDecoder
@@ -13,6 +15,8 @@ __all__ = [
     "AudioEncoder",
     "TextEncoder",
     "TextDecoder",
+    "VideoEncoder",
+    "VideoDecoder",
     "ModalityTrustGating",
     "CrossAttentionFusion",
     "EarlyFusionModule",

@@ -11,6 +11,7 @@ Text Decoder       : Reconstructs the mean token embedding (in embedding space).
 
 import torch
 import torch.nn as nn
+from .video_decoder import VideoDecoder
 
 
 class ImageDecoder(nn.Module):

@@ -32,29 +32,30 @@ logger = logging.getLogger("TrainStage2")
 
 
 def _batch_to_modality_dict(batch, active_modalities, device):
-    """Same batch unpacking logic as train_stage1.py."""
+    """Unpacks a batch into a dict keyed by modality name."""
     modality_data: Dict[str, torch.Tensor] = {}
-    if "image" in active_modalities and "audio" in active_modalities:
-        if "text" in active_modalities:
-            images, audios, texts, targets = batch
-            modality_data["image"] = images.to(device)
-            modality_data["audio"] = audios.to(device)
-            modality_data["text"] = texts.to(device)
-        else:
-            images, audios, targets = batch
-            modality_data["image"] = images.to(device)
-            modality_data["audio"] = audios.to(device)
-    elif "image" in active_modalities:
-        images, targets = batch
-        modality_data["image"] = images.to(device)
-    elif "audio" in active_modalities:
-        audios, targets = batch
-        modality_data["audio"] = audios.to(device)
-    elif "text" in active_modalities:
-        texts, targets = batch
-        modality_data["text"] = texts.to(device)
-    targets = targets.to(device)
-    return modality_data, targets
+    if isinstance(batch, dict):
+        targets = batch.get("label", batch.get("labels", batch.get("target", batch.get("targets", None))))
+        for mod in active_modalities:
+            if mod in batch:
+                modality_data[mod] = batch[mod].to(device)
+        return modality_data, targets.to(device) if targets is not None else None
+
+    if isinstance(batch, (list, tuple)):
+        if len(batch) == 2 and isinstance(batch[0], dict):
+            m_dict, targets = batch
+            for mod in active_modalities:
+                if mod in m_dict:
+                    modality_data[mod] = m_dict[mod].to(device)
+            return modality_data, targets.to(device)
+
+        *mod_tensors, targets = batch
+        for i, mod in enumerate(active_modalities):
+            if i < len(mod_tensors):
+                modality_data[mod] = mod_tensors[i].to(device)
+        return modality_data, targets.to(device)
+
+    raise ValueError(f"Unsupported batch format: {type(batch)}")
 
 
 def extract_features(model: Stage1Model, dataloader, active_modalities, device: torch.device):
@@ -106,6 +107,10 @@ def run_stage2(config: PipelineConfig):
         text_max_seq_len=config.text_max_seq_len,
         text_ff_dim=config.text_ff_dim,
         text_padding_idx=config.text_padding_idx,
+        video_in_channels=getattr(config, "video_in_channels", 3),
+        video_recon_frames=getattr(config, "video_recon_frames", 8),
+        video_recon_height=getattr(config, "video_recon_height", 28),
+        video_recon_width=getattr(config, "video_recon_width", 28),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()

@@ -31,35 +31,36 @@ logger = logging.getLogger("TrainStage1")
 
 
 def _batch_to_modality_dict(batch, active_modalities: List[str], device: torch.device):
-    """Unpacks a batch tuple/dict into a dict keyed by modality name.
+    """Unpacks a batch into a dict keyed by modality name.
 
-    Current AV-MNIST dataloader returns (images, audios, targets).
-    If text is active it expects a 4-tuple (images, audios, texts, targets).
-    Extend this mapping when integrating new datasets / dataloaders.
+    Supports:
+      - Batch as dict: {"image": ..., "video": ..., "label": ...}
+      - Batch as (dict_of_modalities, targets)
+      - Batch as tuple of tensors: (*modality_tensors, targets)
     """
     modality_data: Dict[str, torch.Tensor] = {}
-    if "image" in active_modalities and "audio" in active_modalities:
-        if "text" in active_modalities:
-            images, audios, texts, targets = batch
-            modality_data["image"] = images.to(device)
-            modality_data["audio"] = audios.to(device)
-            modality_data["text"] = texts.to(device)
-        else:
-            images, audios, targets = batch
-            modality_data["image"] = images.to(device)
-            modality_data["audio"] = audios.to(device)
-    elif "image" in active_modalities:
-        images, targets = batch
-        modality_data["image"] = images.to(device)
-    elif "audio" in active_modalities:
-        audios, targets = batch
-        modality_data["audio"] = audios.to(device)
-    elif "text" in active_modalities:
-        texts, targets = batch
-        modality_data["text"] = texts.to(device)
+    if isinstance(batch, dict):
+        targets = batch.get("label", batch.get("labels", batch.get("target", batch.get("targets", None))))
+        for mod in active_modalities:
+            if mod in batch:
+                modality_data[mod] = batch[mod].to(device)
+        return modality_data, targets.to(device) if targets is not None else None
 
-    targets = targets.to(device)
-    return modality_data, targets
+    if isinstance(batch, (list, tuple)):
+        if len(batch) == 2 and isinstance(batch[0], dict):
+            m_dict, targets = batch
+            for mod in active_modalities:
+                if mod in m_dict:
+                    modality_data[mod] = m_dict[mod].to(device)
+            return modality_data, targets.to(device)
+
+        *mod_tensors, targets = batch
+        for i, mod in enumerate(active_modalities):
+            if i < len(mod_tensors):
+                modality_data[mod] = mod_tensors[i].to(device)
+        return modality_data, targets.to(device)
+
+    raise ValueError(f"Unsupported batch format: {type(batch)}")
 
 
 def train_stage1(config: PipelineConfig):
@@ -78,9 +79,6 @@ def train_stage1(config: PipelineConfig):
         f"[{config.dataset_name}] Loading data from '{config.data_dir}' | "
         f"Modalities: {config.active_modalities}"
     )
-    # NOTE: Replace get_avmnist_dataloaders with your dataset-specific loader.
-    # The loader must return (train_loader, val_loader, test_loader, class_counts).
-    # Each batch should be a tuple ordered as per _batch_to_modality_dict above.
     train_loader, val_loader, test_loader, class_counts = get_avmnist_dataloaders(
         data_dir=config.data_dir,
         batch_size=config.batch_size,
@@ -112,6 +110,10 @@ def train_stage1(config: PipelineConfig):
         text_max_seq_len=config.text_max_seq_len,
         text_ff_dim=config.text_ff_dim,
         text_padding_idx=config.text_padding_idx,
+        video_in_channels=getattr(config, "video_in_channels", 3),
+        video_recon_frames=getattr(config, "video_recon_frames", 8),
+        video_recon_height=getattr(config, "video_recon_height", 28),
+        video_recon_width=getattr(config, "video_recon_width", 28),
     ).to(device)
 
     # 3. Multi-Task Criterion (generalized)
@@ -129,6 +131,13 @@ def train_stage1(config: PipelineConfig):
         lr=config.stage1_lr,
         weight_decay=config.stage1_weight_decay,
     )
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=config.stage1_epochs, eta_min=1e-6
+        )
+        if getattr(config, "use_lr_scheduler", True)
+        else None
+    )
 
     history: Dict[str, List[float]] = {
         "loss_total": [],
@@ -144,12 +153,16 @@ def train_stage1(config: PipelineConfig):
         history[f"val_cka_fused_{mod}"] = []
 
     best_val_loss = float("inf")
+    best_model_state = None
+    epochs_no_improve = 0
+    patience = getattr(config, "stage1_patience", 15)
+
     # Checkpoint namespaced by dataset + modality tag + fusion variant
     ckpt_name = f"stage1_{config.modality_tag}_{config.fusion_variant}.pt"
     ckpt_path = os.path.join(config.checkpoint_dir, ckpt_name)
 
     logger.info(
-        f"Training for {config.stage1_epochs} epochs on {device}. "
+        f"Training for up to {config.stage1_epochs} epochs on {device} (patience={patience}). "
         f"Checkpoint: '{ckpt_path}'"
     )
 
@@ -187,6 +200,9 @@ def train_stage1(config: PipelineConfig):
                 "loss": f"{loss_dict['loss_total']:.4f}",
                 "ce": f"{loss_dict['loss_cls']:.4f}"
             })
+
+        if scheduler is not None:
+            scheduler.step()
 
         avg_loss = float(np.mean(epoch_losses["total"]))
         history["loss_total"].append(avg_loss)
@@ -243,6 +259,8 @@ def train_stage1(config: PipelineConfig):
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_no_improve = 0
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             torch.save(
                 {
                     "epoch": epoch,
@@ -255,6 +273,17 @@ def train_stage1(config: PipelineConfig):
                 },
                 ckpt_path,
             )
+        else:
+            epochs_no_improve += 1
+            if patience > 0 and epochs_no_improve >= patience:
+                logger.info(
+                    f"Early stopping triggered at epoch {epoch}: "
+                    f"val_loss has not improved for {patience} consecutive epochs."
+                )
+                break
+
+    if best_model_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
 
     logger.info(
         f"Stage 1 done. Best checkpoint: '{ckpt_path}' (Val Loss: {best_val_loss:.4f})"

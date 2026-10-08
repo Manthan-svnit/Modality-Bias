@@ -3,10 +3,13 @@ __pycache__/
 *.class
 .pytest_cache/
 checkpoints/
-data/
+/data/
 extracted_features/*.pt
 extracted_features/*.npy
 *.pt
 *.pth
 *.tar.gz
 *.zip
+venv/
+.venv/
+env/

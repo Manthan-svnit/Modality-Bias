@@ -68,6 +68,12 @@ class PipelineConfig:
     text_ff_dim: int = 256
     text_padding_idx: int = 0
 
+    # Video
+    video_in_channels: int = 3
+    video_recon_frames: int = 8
+    video_recon_height: int = 28
+    video_recon_width: int = 28
+
     # ------------------------------------------------------------------ #
     # Stage 1 Architecture & Training
     # ------------------------------------------------------------------ #
@@ -79,6 +85,8 @@ class PipelineConfig:
     stage1_lr: float = 1e-4
     stage1_weight_decay: float = 1e-4
     stage1_epochs: int = 100
+    stage1_patience: int = 15
+    use_lr_scheduler: bool = True
 
     # ------------------------------------------------------------------ #
     # Multi-Task Loss Weights & Temperatures
@@ -106,6 +114,7 @@ class PipelineConfig:
     clf_weight_decay: float = 1e-4
     clf_epochs: int = 100
     clf_batch_size: int = 64
+    clf_patience: int = 20
 
     # ------------------------------------------------------------------ #
     # Output Paths (auto-namespaced by dataset_name, populated in __post_init__)
@@ -129,8 +138,8 @@ class PipelineConfig:
 
     @property
     def modality_tag(self) -> str:
-        """Short tag describing active modalities, e.g. 'img_aud_txt'."""
-        abbrev = {"image": "img", "audio": "aud", "text": "txt"}
+        """Short tag describing active modalities, e.g. 'img_aud_txt' or 'img_vid'."""
+        abbrev = {"image": "img", "audio": "aud", "text": "txt", "video": "vid"}
         return "_".join(abbrev.get(m, m) for m in self.active_modalities)
 
 
@@ -142,8 +151,8 @@ def add_pipeline_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
                         help="Path to dataset root directory")
     parser.add_argument("--active_modalities", type=str, nargs="+",
                         default=["image", "audio"],
-                        choices=["image", "audio", "text"],
-                        help="List of active modalities, e.g. --active_modalities image audio text")
+                        choices=["image", "audio", "text", "video"],
+                        help="List of active modalities, e.g. --active_modalities image video audio")
     parser.add_argument("--device", type=str, default="auto",
                         help="Compute device: 'auto', 'cuda', or 'cpu'")
     parser.add_argument("--fusion_variant", type=str, choices=["early", "late"], default="early",
@@ -179,6 +188,16 @@ def add_pipeline_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
                         help="Vocabulary size for text tokenizer")
     parser.add_argument("--text_max_seq_len", type=int, default=128,
                         help="Maximum token sequence length for text encoder")
+    # Video
+    parser.add_argument("--video_in_channels", type=int, default=3,
+                        help="Input channels for video encoder (3=RGB, 1=grayscale)")
+    parser.add_argument("--video_recon_frames", type=int, default=8,
+                        help="Number of reconstructed video frames")
+    # Early stopping & scheduler
+    parser.add_argument("--stage1_patience", type=int, default=15,
+                        help="Early stopping patience for Stage 1 training (epochs)")
+    parser.add_argument("--clf_patience", type=int, default=20,
+                        help="Early stopping patience for Stage 3 classifier training (epochs)")
     return parser
 
 
@@ -204,4 +223,8 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         audio_in_channels=args.audio_in_channels,
         text_vocab_size=args.text_vocab_size,
         text_max_seq_len=args.text_max_seq_len,
+        video_in_channels=getattr(args, "video_in_channels", 3),
+        video_recon_frames=getattr(args, "video_recon_frames", 8),
+        stage1_patience=getattr(args, "stage1_patience", 15),
+        clf_patience=getattr(args, "clf_patience", 20),
     )

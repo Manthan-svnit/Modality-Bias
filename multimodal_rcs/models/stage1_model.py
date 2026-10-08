@@ -1,31 +1,29 @@
 """
-Stage1Model: Generalized Multimodal Architecture
+Stage1Model: Generalized Multimodal Architecture supporting dynamic N-modality inputs.
 
-Supports any subset of 3 modalities: {image, audio, text}.
+Supports any subset of modalities: {image, audio, text, video}.
 Only the modalities listed in `active_modalities` are constructed and used.
 
 Forward pass:
-  - Accepts keyword arguments only for the active modalities.
-  - Missing modalities are silently ignored.
+  - Accepts keyword arguments for any active modality (e.g. image=..., video=..., audio=..., text=...)
+    or a dictionary/positional arguments.
   - Dynamically routes through encoders -> trust gating -> fusion.
+  - Reconstructs inputs using modality-specific decoders.
 
-Output dictionary always contains:
+Output dictionary contains:
   - "z_fused"      : (B, embed_dim) -- final fused representation
   - "logits"       : (B, num_classes) -- classification head output
   - "trust_scores" : (B, N)           -- trust weights for active modalities
-  - Per-modality keys: "z_image", "z_audio", "z_text" (only for active ones)
-  - Reconstruction keys: "recon_image", "recon_audio", "recon_text" (only for active ones)
+  - Per-modality keys: "z_image", "z_audio", "z_text", "z_video" (only for active ones)
+  - Reconstruction keys: "recon_image", "recon_audio", "recon_text", "recon_video" (for active ones)
+  - Legacy convenience aliases: "z_img", "z_aud", "recon_img", "recon_aud"
   - "gated_{mod}"  : gated embedding for each active modality
 
-Image input:   FloatTensor (B, C, H, W)  -- accepts any resolution via AdaptiveAvgPool
-Audio input:   FloatTensor (B, C, H, W)  -- any spectrogram size
-Text input:    LongTensor  (B, seq_len)  -- token ids with optional padding_idx=0
-
-All encoders share the same embed_dim, enabling direct cross-modal attention.
+All encoders project to a uniform embed_dim (e.g. d=128), enabling direct cross-modal attention.
 """
 
 from __future__ import annotations
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple, Any
 import torch
 import torch.nn as nn
 
@@ -33,24 +31,26 @@ from .image_encoder import ImageEncoder
 from .audio_encoder import AudioEncoder
 from .text_encoder import TextEncoder
 from .text_decoder import TextDecoder
+from .video_encoder import VideoEncoder
+from .video_decoder import VideoDecoder
 from .trust_gating import ModalityTrustGating
 from .fusion import EarlyFusionModule, LateFusionModule
 from .decoders import ImageDecoder, AudioDecoder
 
 # Supported modality names (canonical keys)
-VALID_MODALITIES = {"image", "audio", "text"}
+VALID_MODALITIES = {"image", "audio", "text", "video"}
 
 
 class Stage1Model(nn.Module):
     """Generalized multimodal Stage 1 model.
 
-    Constructed with a list of active modalities. At forward time, only the
-    tensors corresponding to active modalities need to be provided.
+    Constructed with a list of active modalities. Dynamically supports any combination
+    (e.g., Image + Audio, Image + Text, Video + Audio, Image + Video + Audio, etc.).
     """
 
     def __init__(
         self,
-        active_modalities: List[str],
+        active_modalities: Optional[List[str]] = None,
         fusion_variant: Literal["early", "late"] = "early",
         embed_dim: int = 128,
         num_classes: int = 10,
@@ -66,11 +66,16 @@ class Stage1Model(nn.Module):
         text_max_seq_len: int = 128,
         text_ff_dim: int = 256,
         text_padding_idx: int = 0,
+        # Video encoder / decoder config
+        video_in_channels: int = 3,
+        video_recon_frames: int = 8,
+        video_recon_height: int = 28,
+        video_recon_width: int = 28,
     ):
         """
         Args:
-            active_modalities   : Subset of ["image", "audio", "text"] to use.
-                                  Must have at least 1 element.
+            active_modalities   : Subset of ["image", "audio", "text", "video"] to use.
+                                  Defaults to ["image", "audio"] for backward compatibility.
             fusion_variant      : "early" or "late" fusion.
             embed_dim           : Shared embedding dimensionality across all modalities.
             num_classes         : Number of output classes for the classification head.
@@ -79,12 +84,19 @@ class Stage1Model(nn.Module):
             dropout             : Dropout probability.
             image_in_channels   : Input channels for images (1=grayscale, 3=RGB).
             audio_in_channels   : Input channels for audio spectrograms.
-            text_vocab_size     : Vocabulary size for the text tokenizer.
+            text_vocab_size     : Vocabulary size for text tokenizer.
             text_max_seq_len    : Maximum token sequence length.
-            text_ff_dim         : Feed-forward dim inside the Transformer text encoder.
-            text_padding_idx    : Padding token id (ignored in text attention mask).
+            text_ff_dim         : Feed-forward dim inside Transformer text encoder.
+            text_padding_idx    : Padding token id.
+            video_in_channels   : Input channels for video (3=RGB, 1=grayscale).
+            video_recon_frames  : Reconstructed video frames.
+            video_recon_height  : Reconstructed video height.
+            video_recon_width   : Reconstructed video width.
         """
         super().__init__()
+
+        if active_modalities is None:
+            active_modalities = ["image", "audio"]
 
         # Validate and store active modalities (preserve order for reproducibility)
         for m in active_modalities:
@@ -92,7 +104,7 @@ class Stage1Model(nn.Module):
                 f"Unknown modality '{m}'. Valid: {VALID_MODALITIES}"
             )
         assert len(active_modalities) >= 1, "Must specify at least 1 active modality."
-        # Deduplicate while preserving order
+
         seen = set()
         self.active_modalities: List[str] = [
             m for m in active_modalities if not (m in seen or seen.add(m))
@@ -123,6 +135,10 @@ class Stage1Model(nn.Module):
                 dropout=dropout,
                 max_seq_len=text_max_seq_len,
                 padding_idx=text_padding_idx,
+            )
+        if "video" in self.active_modalities:
+            self.video_encoder = VideoEncoder(
+                embed_dim=embed_dim, in_channels=video_in_channels
             )
 
         # ------------------------------------------------------------------ #
@@ -156,12 +172,51 @@ class Stage1Model(nn.Module):
         if "audio" in self.active_modalities:
             self.audio_decoder = AudioDecoder(embed_dim=embed_dim)
         if "text" in self.active_modalities:
-            self.text_decoder = TextDecoder(embed_dim=embed_dim, ff_dim=text_ff_dim, dropout=dropout)
+            self.text_decoder = TextDecoder(
+                embed_dim=embed_dim, ff_dim=text_ff_dim, dropout=dropout
+            )
+        if "video" in self.active_modalities:
+            self.video_decoder = VideoDecoder(
+                embed_dim=embed_dim,
+                out_channels=video_in_channels,
+                out_frames=video_recon_frames,
+                out_height=video_recon_height,
+                out_width=video_recon_width,
+            )
 
         # ------------------------------------------------------------------ #
         # Classification Head
         # ------------------------------------------------------------------ #
         self.classifier_head = nn.Linear(embed_dim, num_classes)
+
+    def _normalize_inputs(
+        self, *args, **kwargs
+    ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Tensor]]:
+        """Normalizes positional args or kwargs into a clean dictionary of modality tensors."""
+        inputs: Dict[str, torch.Tensor] = {}
+
+        # 1. Positional arguments map to active modalities in order
+        if len(args) > 0:
+            for i, arg in enumerate(args):
+                if i < len(self.active_modalities) and isinstance(arg, torch.Tensor):
+                    inputs[self.active_modalities[i]] = arg
+
+        # 2. Kwargs mapping with plural and short aliases
+        alias_map = {
+            "image": "image", "images": "image", "img": "image",
+            "audio": "audio", "audios": "audio", "aud": "audio",
+            "text": "text", "texts": "text", "txt": "text",
+            "video": "video", "videos": "video", "vid": "video",
+        }
+        for k, v in kwargs.items():
+            if k == "text_padding_mask":
+                continue
+            canonical = alias_map.get(k, k)
+            if v is not None and isinstance(v, torch.Tensor):
+                inputs[canonical] = v
+
+        text_padding_mask = kwargs.get("text_padding_mask", None)
+        return inputs, text_padding_mask
 
     # ---------------------------------------------------------------------- #
     # Forward
@@ -169,38 +224,42 @@ class Stage1Model(nn.Module):
 
     def forward(
         self,
-        image: Optional[torch.Tensor] = None,
-        audio: Optional[torch.Tensor] = None,
-        text: Optional[torch.Tensor] = None,
-        text_padding_mask: Optional[torch.Tensor] = None,
+        *args,
+        **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
-        Args:
-            image            : FloatTensor (B, C, H, W) -- required if "image" is active.
-            audio            : FloatTensor (B, C, H, W) -- required if "audio" is active.
-            text             : LongTensor  (B, seq_len) -- required if "text" is active.
-            text_padding_mask: Optional BoolTensor (B, seq_len) -- True = padding.
+        Accepts dynamic inputs for any active modalities:
+            model(image=x_img, video=x_vid)
+            model(images, audios)
+            model(**batch_dict)
+
         Returns:
             Dictionary with keys:
                 "z_fused", "logits", "trust_scores",
-                "z_image"/"z_audio"/"z_text"     (for active modalities),
-                "gated_image"/"gated_audio"/"gated_text" (for active modalities),
-                "recon_image"/"recon_audio"/"recon_text" (for active modalities)
+                "z_{mod}", "gated_{mod}", "recon_{mod}" for each active modality,
+                plus backwards-compatible aliases ("z_img", "z_aud", "recon_img", "recon_aud").
         """
+        inputs, text_padding_mask = self._normalize_inputs(*args, **kwargs)
+
         # 1. Encode active modalities
         raw_embeddings: List[torch.Tensor] = []
         mod_keys: List[str] = []
 
         for mod in self.active_modalities:
+            assert mod in inputs, f"Missing input tensor for active modality '{mod}'"
+            x = inputs[mod]
+
             if mod == "image":
-                assert image is not None, "image tensor required for 'image' modality"
-                z = self.image_encoder(image)
+                z = self.image_encoder(x)
             elif mod == "audio":
-                assert audio is not None, "audio tensor required for 'audio' modality"
-                z = self.audio_encoder(audio)
+                z = self.audio_encoder(x)
             elif mod == "text":
-                assert text is not None, "text tensor required for 'text' modality"
-                z = self.text_encoder(text, src_key_padding_mask=text_padding_mask)
+                z = self.text_encoder(x, src_key_padding_mask=text_padding_mask)
+            elif mod == "video":
+                z = self.video_encoder(x)
+            else:
+                raise ValueError(f"Unsupported modality: {mod}")
+
             raw_embeddings.append(z)
             mod_keys.append(mod)
 
@@ -226,15 +285,23 @@ class Stage1Model(nn.Module):
 
             if mod == "image":
                 outputs["recon_image"] = self.image_decoder(z_fused)
+                outputs["recon_img"] = outputs["recon_image"]
+                outputs["z_img"] = raw_embeddings[i]
             elif mod == "audio":
                 outputs["recon_audio"] = self.audio_decoder(z_fused)
+                outputs["recon_aud"] = outputs["recon_audio"]
+                outputs["z_aud"] = raw_embeddings[i]
             elif mod == "text":
-                # Target for text reconstruction = mean token embedding of input
-                # Computed here as the stop-gradient mean embedding (no teacher-forcing needed)
                 with torch.no_grad():
-                    mean_tok_emb = self.text_encoder.token_embedding(text).mean(dim=1)  # (B, D)
+                    mean_tok_emb = self.text_encoder.token_embedding(inputs["text"]).mean(dim=1)
                 outputs["recon_text"] = self.text_decoder(z_fused)
-                outputs["text_mean_emb"] = mean_tok_emb  # reconstruction target
+                outputs["text_mean_emb"] = mean_tok_emb
+                outputs["z_txt"] = raw_embeddings[i]
+            elif mod == "video":
+                # If target video shape is available, pass (T, H, W) to match exactly
+                target_shape = inputs["video"].shape[2:] if "video" in inputs else None
+                outputs["recon_video"] = self.video_decoder(z_fused, target_shape=target_shape)
+                outputs["z_vid"] = raw_embeddings[i]
 
         return outputs
 
@@ -243,20 +310,11 @@ class Stage1Model(nn.Module):
     # ---------------------------------------------------------------------- #
 
     @torch.no_grad()
-    def extract_fused(
-        self,
-        image: Optional[torch.Tensor] = None,
-        audio: Optional[torch.Tensor] = None,
-        text: Optional[torch.Tensor] = None,
-        text_padding_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def extract_fused(self, *args, **kwargs) -> torch.Tensor:
         """Extracts frozen fused representations z_fused for Stage 2.
 
         Returns:
             z_fused: (B, embed_dim)
         """
-        outputs = self.forward(
-            image=image, audio=audio,
-            text=text, text_padding_mask=text_padding_mask
-        )
+        outputs = self.forward(*args, **kwargs)
         return outputs["z_fused"]
