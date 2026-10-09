@@ -1,3 +1,12 @@
+"""
+Stage 1 Training: Encoders, Modality Trust Gating, Cross-Attention Fusion.
+
+Generalized to support any combination of active modalities
+(image, audio, text) on any dataset.
+
+Checkpoint and results are namespaced under the dataset_name from config.
+"""
+
 import os
 import argparse
 import logging
@@ -7,7 +16,7 @@ import torch
 from torch.optim import AdamW
 from tqdm import tqdm
 
-from multimodal_rcs.config import PipelineConfig, add_pipeline_args
+from multimodal_rcs.config import PipelineConfig, add_pipeline_args, config_from_args
 from multimodal_rcs.data import get_avmnist_dataloaders
 from multimodal_rcs.models import Stage1Model
 from multimodal_rcs.losses import MultiTaskLoss
@@ -19,6 +28,39 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("TrainStage1")
+
+
+def _batch_to_modality_dict(batch, active_modalities: List[str], device: torch.device):
+    """Unpacks a batch into a dict keyed by modality name.
+
+    Supports:
+      - Batch as dict: {"image": ..., "video": ..., "label": ...}
+      - Batch as (dict_of_modalities, targets)
+      - Batch as tuple of tensors: (*modality_tensors, targets)
+    """
+    modality_data: Dict[str, torch.Tensor] = {}
+    if isinstance(batch, dict):
+        targets = batch.get("label", batch.get("labels", batch.get("target", batch.get("targets", None))))
+        for mod in active_modalities:
+            if mod in batch:
+                modality_data[mod] = batch[mod].to(device)
+        return modality_data, targets.to(device) if targets is not None else None
+
+    if isinstance(batch, (list, tuple)):
+        if len(batch) == 2 and isinstance(batch[0], dict):
+            m_dict, targets = batch
+            for mod in active_modalities:
+                if mod in m_dict:
+                    modality_data[mod] = m_dict[mod].to(device)
+            return modality_data, targets.to(device)
+
+        *mod_tensors, targets = batch
+        for i, mod in enumerate(active_modalities):
+            if i < len(mod_tensors):
+                modality_data[mod] = mod_tensors[i].to(device)
+        return modality_data, targets.to(device)
+
+    raise ValueError(f"Unsupported batch format: {type(batch)}")
 
 
 def train_stage1(config: PipelineConfig):
@@ -33,7 +75,10 @@ def train_stage1(config: PipelineConfig):
     os.makedirs(config.figures_dir, exist_ok=True)
 
     # 1. DataLoaders
-    logger.info(f"Loading AV-MNIST data from '{config.data_dir}'...")
+    logger.info(
+        f"[{config.dataset_name}] Loading data from '{config.data_dir}' | "
+        f"Modalities: {config.active_modalities}"
+    )
     train_loader, val_loader, test_loader, class_counts = get_avmnist_dataloaders(
         data_dir=config.data_dir,
         batch_size=config.batch_size,
@@ -46,19 +91,34 @@ def train_stage1(config: PipelineConfig):
         random_seed=config.random_seed,
     )
 
-    # 2. Stage 1 Model
-    logger.info(f"Instantiating Stage 1 Model with fusion variant: '{config.fusion_variant}'")
+    # 2. Stage 1 Model (generalized)
+    logger.info(
+        f"Instantiating Stage1Model | fusion={config.fusion_variant} | "
+        f"modalities={config.active_modalities}"
+    )
     model = Stage1Model(
+        active_modalities=config.active_modalities,
         fusion_variant=config.fusion_variant,
         embed_dim=config.embed_dim,
         num_classes=config.num_classes,
         num_heads=config.num_heads,
         num_layers=config.num_layers,
         dropout=config.dropout,
+        image_in_channels=config.image_in_channels,
+        audio_in_channels=config.audio_in_channels,
+        text_vocab_size=config.text_vocab_size,
+        text_max_seq_len=config.text_max_seq_len,
+        text_ff_dim=config.text_ff_dim,
+        text_padding_idx=config.text_padding_idx,
+        video_in_channels=getattr(config, "video_in_channels", 3),
+        video_recon_frames=getattr(config, "video_recon_frames", 8),
+        video_recon_height=getattr(config, "video_recon_height", 28),
+        video_recon_width=getattr(config, "video_recon_width", 28),
     ).to(device)
 
-    # 3. Multi-Task Criterion & Optimizer
+    # 3. Multi-Task Criterion (generalized)
     criterion = MultiTaskLoss(
+        active_modalities=config.active_modalities,
         weight_recon=config.weight_recon,
         weight_cls=config.weight_cls,
         weight_supcon=config.weight_supcon,
@@ -71,6 +131,13 @@ def train_stage1(config: PipelineConfig):
         lr=config.stage1_lr,
         weight_decay=config.stage1_weight_decay,
     )
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=config.stage1_epochs, eta_min=1e-6
+        )
+        if getattr(config, "use_lr_scheduler", True)
+        else None
+    )
 
     history: Dict[str, List[float]] = {
         "loss_total": [],
@@ -80,41 +147,44 @@ def train_stage1(config: PipelineConfig):
         "loss_cmm": [],
         "val_loss": [],
         "val_acc": [],
-        "val_cka_fused_img": [],
-        "val_cka_fused_aud": [],
     }
+    # Add per-modality CKA tracking (fused vs each modality)
+    for mod in config.active_modalities:
+        history[f"val_cka_fused_{mod}"] = []
 
     best_val_loss = float("inf")
-    ckpt_path = os.path.join(
-        config.checkpoint_dir, f"stage1_{config.fusion_variant}.pt"
-    )
+    best_model_state = None
+    epochs_no_improve = 0
+    patience = getattr(config, "stage1_patience", 15)
 
-    logger.info(f"Starting Stage 1 training for {config.stage1_epochs} epochs on {device}...")
+    # Checkpoint namespaced by dataset + modality tag + fusion variant
+    ckpt_name = f"stage1_{config.modality_tag}_{config.fusion_variant}.pt"
+    ckpt_path = os.path.join(config.checkpoint_dir, ckpt_name)
+
+    logger.info(
+        f"Training for up to {config.stage1_epochs} epochs on {device} (patience={patience}). "
+        f"Checkpoint: '{ckpt_path}'"
+    )
 
     for epoch in range(1, config.stage1_epochs + 1):
         model.train()
         epoch_losses: Dict[str, List[float]] = {
-            "total": [],
-            "cls": [],
-            "recon": [],
-            "supcon": [],
-            "cmm": [],
+            "total": [], "cls": [], "recon": [], "supcon": [], "cmm": []
         }
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{config.stage1_epochs:03d}", leave=False)
-        for images, audios, targets in pbar:
-            images = images.to(device)
-            audios = audios.to(device)
-            targets = targets.to(device)
+        for batch in pbar:
+            modality_data, targets = _batch_to_modality_dict(
+                batch, config.active_modalities, device
+            )
 
             optimizer.zero_grad()
-            outputs = model(images, audios)
+            outputs = model(**modality_data)
 
             loss, loss_dict = criterion(
                 outputs=outputs,
                 targets=targets,
-                orig_images=images,
-                orig_audios=audios,
+                orig_inputs=modality_data,
             )
 
             loss.backward()
@@ -126,9 +196,14 @@ def train_stage1(config: PipelineConfig):
             epoch_losses["supcon"].append(loss_dict["loss_supcon"])
             epoch_losses["cmm"].append(loss_dict["loss_cmm"])
 
-            pbar.set_postfix({"loss": f"{loss_dict['loss_total']:.4f}", "ce": f"{loss_dict['loss_cls']:.4f}"})
+            pbar.set_postfix({
+                "loss": f"{loss_dict['loss_total']:.4f}",
+                "ce": f"{loss_dict['loss_cls']:.4f}"
+            })
 
-        # Epoch training statistics
+        if scheduler is not None:
+            scheduler.step()
+
         avg_loss = float(np.mean(epoch_losses["total"]))
         history["loss_total"].append(avg_loss)
         history["loss_cls"].append(float(np.mean(epoch_losses["cls"])))
@@ -140,51 +215,52 @@ def train_stage1(config: PipelineConfig):
         model.eval()
         val_losses = []
         correct = 0
-        total = 0
-        val_fused_list, val_img_list, val_aud_list = [], [], []
+        total_val = 0
+        z_lists: Dict[str, List[torch.Tensor]] = {mod: [] for mod in config.active_modalities}
+        z_fused_list = []
 
         with torch.no_grad():
-            for images, audios, targets in val_loader:
-                images = images.to(device)
-                audios = audios.to(device)
-                targets = targets.to(device)
-
-                outputs = model(images, audios)
-                v_loss, _ = criterion(outputs, targets, images, audios)
+            for batch in val_loader:
+                modality_data, targets = _batch_to_modality_dict(
+                    batch, config.active_modalities, device
+                )
+                outputs = model(**modality_data)
+                v_loss, _ = criterion(outputs, targets, modality_data)
                 val_losses.append(v_loss.item())
 
                 preds = outputs["logits"].argmax(dim=-1)
                 correct += (preds == targets).sum().item()
-                total += targets.size(0)
+                total_val += targets.size(0)
 
-                val_fused_list.append(outputs["z_fused"].cpu())
-                val_img_list.append(outputs["z_img"].cpu())
-                val_aud_list.append(outputs["z_aud"].cpu())
+                z_fused_list.append(outputs["z_fused"].cpu())
+                for mod in config.active_modalities:
+                    z_lists[mod].append(outputs[f"z_{mod}"].cpu())
 
         val_loss = float(np.mean(val_losses))
-        val_acc = correct / total
+        val_acc = correct / total_val
 
-        # Compute CKA between fused representation and each modality representation
-        val_fused_all = torch.cat(val_fused_list, dim=0)
-        val_img_all = torch.cat(val_img_list, dim=0)
-        val_aud_all = torch.cat(val_aud_list, dim=0)
-
-        cka_fused_img = linear_cka(val_fused_all, val_img_all)
-        cka_fused_aud = linear_cka(val_fused_all, val_aud_all)
+        z_fused_all = torch.cat(z_fused_list, dim=0)
+        for mod in config.active_modalities:
+            z_mod_all = torch.cat(z_lists[mod], dim=0)
+            cka_val = linear_cka(z_fused_all, z_mod_all)
+            history[f"val_cka_fused_{mod}"].append(cka_val)
 
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
-        history["val_cka_fused_img"].append(cka_fused_img)
-        history["val_cka_fused_aud"].append(cka_fused_aud)
 
+        cka_summary = " | ".join(
+            f"CKA(fused,{m}): {history[f'val_cka_fused_{m}'][-1]:.4f}"
+            for m in config.active_modalities
+        )
         logger.info(
-            f"Epoch {epoch:03d} | Train Loss: {avg_loss:.4f} | Val Loss: {val_loss:.4f} | "
-            f"Val Acc: {val_acc:.4f} | CKA(Fused, Img): {cka_fused_img:.4f} | CKA(Fused, Aud): {cka_fused_aud:.4f}"
+            f"Epoch {epoch:03d} | Train Loss: {avg_loss:.4f} | "
+            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | {cka_summary}"
         )
 
-        # Save best model checkpoint
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_no_improve = 0
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             torch.save(
                 {
                     "epoch": epoch,
@@ -197,35 +273,35 @@ def train_stage1(config: PipelineConfig):
                 },
                 ckpt_path,
             )
+        else:
+            epochs_no_improve += 1
+            if patience > 0 and epochs_no_improve >= patience:
+                logger.info(
+                    f"Early stopping triggered at epoch {epoch}: "
+                    f"val_loss has not improved for {patience} consecutive epochs."
+                )
+                break
 
-    logger.info(f"Stage 1 training finished. Best checkpoint saved to '{ckpt_path}' (Val Loss: {best_val_loss:.4f})")
+    if best_model_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
 
-    # Save training curves plot
+    logger.info(
+        f"Stage 1 done. Best checkpoint: '{ckpt_path}' (Val Loss: {best_val_loss:.4f})"
+    )
+
     fig_path = os.path.join(
-        config.figures_dir, f"stage1_{config.fusion_variant}_history.png"
+        config.figures_dir,
+        f"stage1_{config.modality_tag}_{config.fusion_variant}_history.png"
     )
     plot_stage1_metrics(history, save_path=fig_path)
-    logger.info(f"Saved Stage 1 training curves & CKA metrics plot to '{fig_path}'")
+    logger.info(f"Saved training curves to '{fig_path}'")
 
     return ckpt_path, history
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 1: Encoders & Cross-Attention Fusion Training")
+    parser = argparse.ArgumentParser(description="Stage 1: Multimodal Encoder & Fusion Training")
     parser = add_pipeline_args(parser)
     args = parser.parse_args()
-
-    cfg = PipelineConfig(
-        data_dir=args.data_dir,
-        device=args.device,
-        fusion_variant=args.fusion_variant,
-        stage1_epochs=args.stage1_epochs,
-        stage1_lr=args.stage1_lr,
-        batch_size=args.batch_size,
-        eta=args.eta,
-        shrinkage_lambda=args.shrinkage_lambda,
-        clf_epochs=args.clf_epochs,
-        clf_lr=args.clf_lr,
-        random_seed=args.random_seed,
-    )
+    cfg = config_from_args(args)
     train_stage1(cfg)

@@ -1,3 +1,10 @@
+"""
+Stage 2: Feature Extraction & Regularized Covariance Sharing (RCS) Balancing.
+
+Generalized to support any combination of active modalities on any dataset.
+All outputs (features, metrics, plots) are namespaced by dataset_name.
+"""
+
 import os
 import json
 import argparse
@@ -7,7 +14,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from multimodal_rcs.config import PipelineConfig, add_pipeline_args
+from multimodal_rcs.config import PipelineConfig, add_pipeline_args, config_from_args
 from multimodal_rcs.data import get_avmnist_dataloaders
 from multimodal_rcs.models import Stage1Model
 from multimodal_rcs.rcs import MultimodalRCSBalancer, evaluate_prdc, evaluate_classwise_prdc
@@ -24,19 +31,45 @@ logging.basicConfig(
 logger = logging.getLogger("TrainStage2")
 
 
-def extract_features(model: Stage1Model, dataloader, device: torch.device):
+def _batch_to_modality_dict(batch, active_modalities, device):
+    """Unpacks a batch into a dict keyed by modality name."""
+    modality_data: Dict[str, torch.Tensor] = {}
+    if isinstance(batch, dict):
+        targets = batch.get("label", batch.get("labels", batch.get("target", batch.get("targets", None))))
+        for mod in active_modalities:
+            if mod in batch:
+                modality_data[mod] = batch[mod].to(device)
+        return modality_data, targets.to(device) if targets is not None else None
+
+    if isinstance(batch, (list, tuple)):
+        if len(batch) == 2 and isinstance(batch[0], dict):
+            m_dict, targets = batch
+            for mod in active_modalities:
+                if mod in m_dict:
+                    modality_data[mod] = m_dict[mod].to(device)
+            return modality_data, targets.to(device)
+
+        *mod_tensors, targets = batch
+        for i, mod in enumerate(active_modalities):
+            if i < len(mod_tensors):
+                modality_data[mod] = mod_tensors[i].to(device)
+        return modality_data, targets.to(device)
+
+    raise ValueError(f"Unsupported batch format: {type(batch)}")
+
+
+def extract_features(model: Stage1Model, dataloader, active_modalities, device: torch.device):
     """Extracts fused representations z_fused and corresponding labels."""
     model.eval()
     fused_list = []
     labels_list = []
 
     with torch.no_grad():
-        for images, audios, targets in dataloader:
-            images = images.to(device)
-            audios = audios.to(device)
-            z_fused = model.extract_fused(images, audios)
+        for batch in tqdm(dataloader, desc="Extracting features", leave=False):
+            modality_data, targets = _batch_to_modality_dict(batch, active_modalities, device)
+            z_fused = model.extract_fused(**modality_data)
             fused_list.append(z_fused.cpu().numpy())
-            labels_list.append(targets.numpy())
+            labels_list.append(targets.cpu().numpy())
 
     features = np.vstack(fused_list)
     labels = np.concatenate(labels_list)
@@ -49,34 +82,43 @@ def run_stage2(config: PipelineConfig):
     os.makedirs(config.results_dir, exist_ok=True)
     os.makedirs(config.figures_dir, exist_ok=True)
 
-    ckpt_path = os.path.join(
-        config.checkpoint_dir, f"stage1_{config.fusion_variant}.pt"
-    )
+    # Checkpoint namespaced identically to train_stage1
+    ckpt_name = f"stage1_{config.modality_tag}_{config.fusion_variant}.pt"
+    ckpt_path = os.path.join(config.checkpoint_dir, ckpt_name)
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(
             f"Stage 1 checkpoint not found at '{ckpt_path}'. Run train_stage1.py first."
         )
 
-    # 1. Load trained Stage 1 Model & Freeze parameters
-    logger.info(f"Loading Stage 1 Model checkpoint from '{ckpt_path}'...")
+    # 1. Load & freeze Stage 1 Model
+    logger.info(f"[{config.dataset_name}] Loading Stage 1 checkpoint '{ckpt_path}'...")
     checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     model = Stage1Model(
+        active_modalities=config.active_modalities,
         fusion_variant=config.fusion_variant,
         embed_dim=config.embed_dim,
         num_classes=config.num_classes,
         num_heads=config.num_heads,
         num_layers=config.num_layers,
         dropout=config.dropout,
+        image_in_channels=config.image_in_channels,
+        audio_in_channels=config.audio_in_channels,
+        text_vocab_size=config.text_vocab_size,
+        text_max_seq_len=config.text_max_seq_len,
+        text_ff_dim=config.text_ff_dim,
+        text_padding_idx=config.text_padding_idx,
+        video_in_channels=getattr(config, "video_in_channels", 3),
+        video_recon_frames=getattr(config, "video_recon_frames", 8),
+        video_recon_height=getattr(config, "video_recon_height", 28),
+        video_recon_width=getattr(config, "video_recon_width", 28),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-
-    # Freeze all parameters
     for param in model.parameters():
         param.requires_grad = False
-    logger.info("Stage 1 encoders and fusion module successfully frozen.")
+    logger.info("Stage 1 model frozen.")
 
-    # 2. Extract features
+    # 2. Load data
     logger.info("Loading dataset splits...")
     train_loader, val_loader, test_loader, original_counts = get_avmnist_dataloaders(
         data_dir=config.data_dir,
@@ -90,36 +132,43 @@ def run_stage2(config: PipelineConfig):
         random_seed=config.random_seed,
     )
 
-    logger.info("Extracting fused representations for train, val, and test splits...")
-    train_feats, train_labels = extract_features(model, train_loader, device)
-    val_feats, val_labels = extract_features(model, val_loader, device)
-    test_feats, test_labels = extract_features(model, test_loader, device)
+    # 3. Extract features
+    tag = f"{config.modality_tag}_{config.fusion_variant}"
+    logger.info(f"Extracting fused representations (tag={tag})...")
+    train_feats, train_labels = extract_features(model, train_loader, config.active_modalities, device)
+    val_feats,   val_labels   = extract_features(model, val_loader,   config.active_modalities, device)
+    test_feats,  test_labels  = extract_features(model, test_loader,  config.active_modalities, device)
 
-    # Save raw extracted features
-    raw_train_save = os.path.join(config.features_dir, f"train_raw_{config.fusion_variant}.npz")
-    val_save = os.path.join(config.features_dir, f"val_{config.fusion_variant}.npz")
-    test_save = os.path.join(config.features_dir, f"test_{config.fusion_variant}.npz")
+    # Save raw features
+    np.savez_compressed(
+        os.path.join(config.features_dir, f"train_raw_{tag}.npz"),
+        features=train_feats, labels=train_labels
+    )
+    np.savez_compressed(
+        os.path.join(config.features_dir, f"val_{tag}.npz"),
+        features=val_feats, labels=val_labels
+    )
+    np.savez_compressed(
+        os.path.join(config.features_dir, f"test_{tag}.npz"),
+        features=test_feats, labels=test_labels
+    )
+    logger.info(
+        f"Extracted: train {train_feats.shape}, val {val_feats.shape}, test {test_feats.shape}"
+    )
 
-    np.savez_compressed(raw_train_save, features=train_feats, labels=train_labels)
-    np.savez_compressed(val_save, features=val_feats, labels=val_labels)
-    np.savez_compressed(test_save, features=test_feats, labels=test_labels)
-    logger.info(f"Extracted train features: {train_feats.shape}, val: {val_feats.shape}, test: {test_feats.shape}")
-
-    # 3. Regularized Covariance Sharing (RCS) Balancing
-    logger.info(f"Applying Multimodal RCS with eta={config.eta}, lambda={config.shrinkage_lambda}...")
+    # 4. RCS Balancing
+    logger.info(f"Applying RCS (eta={config.eta}, lambda={config.shrinkage_lambda})...")
     balancer = MultimodalRCSBalancer(
         eta=config.eta,
         shrinkage_lambda=config.shrinkage_lambda,
         top_k=config.top_k_components,
         random_state=config.random_seed,
     )
-
     balanced_feats, balanced_labels, is_synthetic_mask, info_dict = balancer.balance(
         features=train_feats, labels=train_labels
     )
 
-    # Save balanced features
-    balanced_save = os.path.join(config.features_dir, f"train_balanced_rcs_{config.fusion_variant}.npz")
+    balanced_save = os.path.join(config.features_dir, f"train_balanced_rcs_{tag}.npz")
     np.savez_compressed(
         balanced_save,
         features=balanced_feats,
@@ -128,8 +177,8 @@ def run_stage2(config: PipelineConfig):
     )
     logger.info(f"Saved RCS balanced features to '{balanced_save}'")
 
-    # 4. Evaluate synthetic representations using PRDC
-    logger.info("Evaluating synthetic representations using PRDC (Precision, Recall, Density, Coverage)...")
+    # 5. PRDC Evaluation
+    logger.info("Evaluating synthetic representations with PRDC...")
     real_feats = balanced_feats[~is_synthetic_mask]
     synth_feats = balanced_feats[is_synthetic_mask]
 
@@ -142,6 +191,8 @@ def run_stage2(config: PipelineConfig):
     )
 
     prdc_results = {
+        "dataset_name": config.dataset_name,
+        "active_modalities": config.active_modalities,
         "fusion_variant": config.fusion_variant,
         "eta": config.eta,
         "shrinkage_lambda": config.shrinkage_lambda,
@@ -157,53 +208,34 @@ def run_stage2(config: PipelineConfig):
         "total_balanced": int(info_dict["total_samples"]),
     }
 
-    prdc_json_path = os.path.join(
-        config.results_dir, f"prdc_metrics_{config.fusion_variant}.json"
-    )
+    prdc_json_path = os.path.join(config.results_dir, f"prdc_metrics_{tag}.json")
     with open(prdc_json_path, "w") as f:
         json.dump(prdc_results, f, indent=2)
 
-    logger.info("PRDC Evaluation Summary:")
     logger.info(
-        f"  Precision: {overall_prdc['precision']:.4f} | Recall: {overall_prdc['recall']:.4f} | "
-        f"Density: {overall_prdc['density']:.4f} | Coverage: {overall_prdc['coverage']:.4f}"
+        f"PRDC | P: {overall_prdc['precision']:.4f} | R: {overall_prdc['recall']:.4f} | "
+        f"D: {overall_prdc['density']:.4f} | C: {overall_prdc['coverage']:.4f}"
     )
     logger.info(f"Saved PRDC metrics to '{prdc_json_path}'")
 
-    # 5. Output t-SNE and UMAP plots before and after RCS oversampling
-    logger.info("Generating t-SNE comparison plot...")
-    tsne_fig_path = os.path.join(
-        config.figures_dir, f"tsne_rcs_comparison_{config.fusion_variant}.png"
-    )
-    plot_embedding_comparison(
-        feats_before=train_feats,
-        labels_before=train_labels,
-        feats_after=balanced_feats,
-        labels_after=balanced_labels,
-        is_synthetic_mask=is_synthetic_mask,
-        method="tsne",
-        title_suffix=f"Fusion: {config.fusion_variant.upper()}",
-        save_path=tsne_fig_path,
-        random_state=config.random_seed,
-    )
-    logger.info(f"Saved t-SNE comparison plot to '{tsne_fig_path}'")
-
-    logger.info("Generating UMAP comparison plot...")
-    umap_fig_path = os.path.join(
-        config.figures_dir, f"umap_rcs_comparison_{config.fusion_variant}.png"
-    )
-    plot_embedding_comparison(
-        feats_before=train_feats,
-        labels_before=train_labels,
-        feats_after=balanced_feats,
-        labels_after=balanced_labels,
-        is_synthetic_mask=is_synthetic_mask,
-        method="umap",
-        title_suffix=f"Fusion: {config.fusion_variant.upper()}",
-        save_path=umap_fig_path,
-        random_state=config.random_seed,
-    )
-    logger.info(f"Saved UMAP comparison plot to '{umap_fig_path}'")
+    # 6. Embedding Visualizations
+    for method in ["tsne", "umap"]:
+        fig_path = os.path.join(config.figures_dir, f"{method}_rcs_comparison_{tag}.png")
+        try:
+            plot_embedding_comparison(
+                feats_before=train_feats,
+                labels_before=train_labels,
+                feats_after=balanced_feats,
+                labels_after=balanced_labels,
+                is_synthetic_mask=is_synthetic_mask,
+                method=method,
+                title_suffix=f"{config.dataset_name} | {tag}",
+                save_path=fig_path,
+                random_state=config.random_seed,
+            )
+            logger.info(f"Saved {method.upper()} plot to '{fig_path}'")
+        except Exception as e:
+            logger.warning(f"Could not generate {method.upper()} plot: {e}")
 
     return balanced_save, prdc_results
 
@@ -212,18 +244,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stage 2: Feature Extraction & RCS Balancing")
     parser = add_pipeline_args(parser)
     args = parser.parse_args()
-
-    cfg = PipelineConfig(
-        data_dir=args.data_dir,
-        device=args.device,
-        fusion_variant=args.fusion_variant,
-        stage1_epochs=args.stage1_epochs,
-        stage1_lr=args.stage1_lr,
-        batch_size=args.batch_size,
-        eta=args.eta,
-        shrinkage_lambda=args.shrinkage_lambda,
-        clf_epochs=args.clf_epochs,
-        clf_lr=args.clf_lr,
-        random_seed=args.random_seed,
-    )
+    cfg = config_from_args(args)
     run_stage2(cfg)

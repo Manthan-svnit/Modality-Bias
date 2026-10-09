@@ -1,85 +1,168 @@
+"""
+Generalized N-Modality Cross-Attention Fusion.
+
+Replaces the hardcoded 2-modality (image, audio) CrossAttentionFusion with a
+dynamic module that:
+
+  1. Accepts a list of N modality embeddings.
+  2. Applies pairwise cross-attention between all unique (i, j) modality pairs.
+  3. Aggregates the refined embeddings (mean pooling).
+  4. Projects to a fixed embed_dim output vector.
+
+Supports both Early and Late fusion variants for arbitrary N.
+
+--- Architecture ---
+
+EarlyFusionModule  (N modalities):
+  Cross-attention applied directly after encoders and trust gating.
+
+LateFusionModule   (N modalities):
+  Each modality first passes through a dedicated intermediate FFN before
+  cross-attention, allowing deeper modality-specific processing.
+"""
+
+from typing import List, Tuple
 import torch
 import torch.nn as nn
-from typing import Tuple
 
 
-class CrossAttentionLayer(nn.Module):
-    """Bidirectional Cross-Attention Layer between two modalities with residual connections and FFN."""
+# ---------------------------------------------------------------------------
+# Pairwise Cross-Attention Layer
+# ---------------------------------------------------------------------------
 
-    def __init__(self, dim: int = 128, num_heads: int = 4, dropout: float = 0.1):
+class PairwiseCrossAttentionLayer(nn.Module):
+    """Applies bidirectional cross-attention between every pair of modalities.
+
+    For N modalities: processes N*(N-1) directed attention operations.
+    Each modality i attends to all other modalities j, accumulating context
+    through residual connections and a position-wise FFN.
+    """
+
+    def __init__(self, num_modalities: int, dim: int = 128, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
-        # Image attends to Audio
-        self.attn_img_to_aud = nn.MultiheadAttention(
-            embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True
-        )
-        self.norm_img_attn = nn.LayerNorm(dim)
-        self.ffn_img = nn.Sequential(
-            nn.Linear(dim, dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim * 2, dim),
-            nn.Dropout(dropout),
-        )
-        self.norm_img_ffn = nn.LayerNorm(dim)
+        self.num_modalities = num_modalities
+        self.dim = dim
 
-        # Audio attends to Image
-        self.attn_aud_to_img = nn.MultiheadAttention(
-            embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True
-        )
-        self.norm_aud_attn = nn.LayerNorm(dim)
-        self.ffn_aud = nn.Sequential(
-            nn.Linear(dim, dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim * 2, dim),
-            nn.Dropout(dropout),
-        )
-        self.norm_aud_ffn = nn.LayerNorm(dim)
+        # For each (query_modality, key_modality) pair where i != j,
+        # create a dedicated cross-attention + FFN block.
+        # Stored in a flat ModuleList indexed by i * N + j.
+        N = num_modalities
+        self.cross_attns = nn.ModuleList()
+        for i in range(N):
+            for j in range(N):
+                if i == j:
+                    self.cross_attns.append(nn.Identity())
+                else:
+                    self.cross_attns.append(
+                        nn.MultiheadAttention(
+                            embed_dim=dim, num_heads=num_heads,
+                            dropout=dropout, batch_first=True
+                        )
+                    )
 
+        # One post-attention norm, FFN, and FFN norm per modality
+        self.attn_norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(N)])
+        self.ffns = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, dim * 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim * 2, dim),
+                nn.Dropout(dropout),
+            )
+            for _ in range(N)
+        ])
+        self.ffn_norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(N)])
         self.drop = nn.Dropout(dropout)
 
-    def forward(
-        self, z_img: torch.Tensor, z_aud: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _idx(self, i: int, j: int) -> int:
+        return i * self.num_modalities + j
+
+    def forward(self, modalities: List[torch.Tensor]) -> List[torch.Tensor]:
         """
         Args:
-            z_img: (B, 1, dim)
-            z_aud: (B, 1, dim)
+            modalities: List of N tensors, each (B, 1, dim)
         Returns:
-            Tuple of updated (z_img, z_aud) each (B, 1, dim)
+            Updated list of N tensors, each (B, 1, dim)
         """
-        # 1. Image attends to Audio
-        out_img_attn, _ = self.attn_img_to_aud(query=z_img, key=z_aud, value=z_aud)
-        z_img = self.norm_img_attn(z_img + self.drop(out_img_attn))
-        z_img = self.norm_img_ffn(z_img + self.ffn_img(z_img))
+        N = self.num_modalities
+        if N == 1:
+            return modalities
 
-        # 2. Audio attends to Image
-        out_aud_attn, _ = self.attn_aud_to_img(query=z_aud, key=z_img, value=z_img)
-        z_aud = self.norm_aud_attn(z_aud + self.drop(out_aud_attn))
-        z_aud = self.norm_aud_ffn(z_aud + self.ffn_aud(z_aud))
+        updated = list(modalities)
 
-        return z_img, z_aud
+        # Accumulate cross-attention updates independently (all from previous step)
+        updates = [torch.zeros_like(z) for z in modalities]
+        for i in range(N):
+            for j in range(N):
+                if i == j:
+                    continue
+                idx = self._idx(i, j)
+                q = modalities[i]   # (B, 1, dim)
+                k = modalities[j]   # (B, 1, dim)
+                attn_out, _ = self.cross_attns[idx](query=q, key=k, value=k)
+                updates[i] = updates[i] + self.drop(attn_out)
+
+        # Apply accumulated residual + FFN per modality
+        for i in range(N):
+            num_others = N - 1
+            avg_update = updates[i] / max(1, num_others)
+            h = self.attn_norms[i](modalities[i] + avg_update)
+            ffn_out = self.ffns[i](h)
+            h = self.ffn_norms[i](h + ffn_out)
+            updated[i] = h
+
+        return updated
+
+
+# ---------------------------------------------------------------------------
+# Cross-Attention Fusion Stack
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Cross-Attention Fusion Stack
+# ---------------------------------------------------------------------------
+
+def _extract_embeddings_arg(*args, **kwargs) -> List[torch.Tensor]:
+    """Helper to support both list input and unpacked *args inputs."""
+    if len(args) == 1 and isinstance(args[0], (list, tuple)):
+        return list(args[0])
+    if len(args) > 0:
+        return list(args)
+    if "embeddings" in kwargs:
+        return list(kwargs["embeddings"])
+    raise ValueError("Expected modality embeddings as a list or positional arguments.")
 
 
 class CrossAttentionFusion(nn.Module):
-    """Stack of 2 Cross-Attention Layers (4 heads, dim 128, dropout 0.1) yielding fused 128-d vector."""
+    """Stack of PairwiseCrossAttentionLayers followed by projection.
+
+    Output shape: (B, dim) regardless of number of modalities N.
+    """
 
     def __init__(
         self,
+        num_modalities: int = 2,
         dim: int = 128,
         num_heads: int = 4,
         num_layers: int = 2,
         dropout: float = 0.1,
     ):
         super().__init__()
-        self.layers = nn.ModuleList(
-            [
-                CrossAttentionLayer(dim=dim, num_heads=num_heads, dropout=dropout)
-                for _ in range(num_layers)
-            ]
-        )
+        self.num_modalities = num_modalities
+        self.dim = dim
+
+        self.layers = nn.ModuleList([
+            PairwiseCrossAttentionLayer(
+                num_modalities=num_modalities,
+                dim=dim, num_heads=num_heads, dropout=dropout
+            )
+            for _ in range(num_layers)
+        ])
+
+        # Project concatenated modalities to embed_dim
         self.fusion_projection = nn.Sequential(
-            nn.Linear(dim * 2, dim),
+            nn.Linear(dim * num_modalities, dim),
             nn.LayerNorm(dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -87,36 +170,40 @@ class CrossAttentionFusion(nn.Module):
             nn.LayerNorm(dim),
         )
 
-    def forward(self, z_img: torch.Tensor, z_aud: torch.Tensor) -> torch.Tensor:
+    def forward(self, *args, **kwargs) -> torch.Tensor:
         """
         Args:
-            z_img: (B, dim)
-            z_aud: (B, dim)
+            embeddings: List of N tensors, each (B, dim), OR positional *args
         Returns:
             z_fused: (B, dim)
         """
-        # Expand token dimension: (B, 1, dim)
-        h_img = z_img.unsqueeze(1)
-        h_aud = z_aud.unsqueeze(1)
+        embeddings = _extract_embeddings_arg(*args, **kwargs)
+        # Expand token dimension for cross-attention: (B, 1, dim)
+        h = [z.unsqueeze(1) for z in embeddings]
 
         for layer in self.layers:
-            h_img, h_aud = layer(h_img, h_aud)
+            h = layer(h)
 
-        # Squeeze token dimension: (B, dim)
-        h_img = h_img.squeeze(1)
-        h_aud = h_aud.squeeze(1)
+        # Squeeze and concat: (B, N * dim)
+        h_flat = [x.squeeze(1) for x in h]
+        concat = torch.cat(h_flat, dim=-1)
 
-        # Merge representations
-        concat = torch.cat([h_img, h_aud], dim=-1)  # (B, dim * 2)
-        z_fused = self.fusion_projection(concat)     # (B, dim)
-        return z_fused
+        return self.fusion_projection(concat)
 
+
+# ---------------------------------------------------------------------------
+# Early and Late Fusion Modules (generalized to N modalities)
+# ---------------------------------------------------------------------------
 
 class EarlyFusionModule(nn.Module):
-    """Variant 1 (Early Fusion): Cross-attention directly applied after encoders and trust gating."""
+    """Early Fusion: Cross-attention directly after encoders and trust gating.
+
+    Supports N modalities.
+    """
 
     def __init__(
         self,
+        num_modalities: int = 2,
         dim: int = 128,
         num_heads: int = 4,
         num_layers: int = 2,
@@ -124,48 +211,67 @@ class EarlyFusionModule(nn.Module):
     ):
         super().__init__()
         self.cross_attention = CrossAttentionFusion(
-            dim=dim, num_heads=num_heads, num_layers=num_layers, dropout=dropout
+            num_modalities=num_modalities,
+            dim=dim, num_heads=num_heads,
+            num_layers=num_layers, dropout=dropout,
         )
 
-    def forward(self, z_img: torch.Tensor, z_aud: torch.Tensor) -> torch.Tensor:
-        return self.cross_attention(z_img, z_aud)
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        """
+        Args:
+            embeddings: List of N tensors, each (B, dim), or unpacked *args
+        Returns:
+            z_fused: (B, dim)
+        """
+        embeddings = _extract_embeddings_arg(*args, **kwargs)
+        return self.cross_attention(embeddings)
 
 
 class LateFusionModule(nn.Module):
-    """Variant 2 (Late Fusion): Intermediate feed-forward processing on each modality before cross-attention."""
+    """Late Fusion: Each modality passes through its own intermediate FFN
+    before cross-attention, allowing deeper modality-specific processing.
+
+    Supports N modalities.
+    """
 
     def __init__(
         self,
+        num_modalities: int = 2,
         dim: int = 128,
         num_heads: int = 4,
         num_layers: int = 2,
         dropout: float = 0.1,
     ):
         super().__init__()
-        # Intermediate feed-forward processing on each modality
-        self.img_intermediate_ffn = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-        )
-        self.aud_intermediate_ffn = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-        )
+        self.num_modalities = num_modalities
+
+        # One intermediate FFN per modality
+        self.intermediate_ffns = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, dim),
+                nn.LayerNorm(dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+                nn.Linear(dim, dim),
+                nn.LayerNorm(dim),
+            )
+            for _ in range(num_modalities)
+        ])
+
         self.cross_attention = CrossAttentionFusion(
-            dim=dim, num_heads=num_heads, num_layers=num_layers, dropout=dropout
+            num_modalities=num_modalities,
+            dim=dim, num_heads=num_heads,
+            num_layers=num_layers, dropout=dropout,
         )
 
-    def forward(self, z_img: torch.Tensor, z_aud: torch.Tensor) -> torch.Tensor:
-        # Intermediate modality representations
-        h_img = self.img_intermediate_ffn(z_img)
-        h_aud = self.aud_intermediate_ffn(z_aud)
-        # Cross-attention fusion
-        return self.cross_attention(h_img, h_aud)
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        """
+        Args:
+            embeddings: List of N tensors, each (B, dim), or unpacked *args
+        Returns:
+            z_fused: (B, dim)
+        """
+        embeddings = _extract_embeddings_arg(*args, **kwargs)
+        h = [ffn(z) for ffn, z in zip(self.intermediate_ffns, embeddings)]
+        return self.cross_attention(h)
+

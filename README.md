@@ -48,13 +48,16 @@ python -m pytest tests/
 ```
 
 ### 3. Stage 1: Encoders, Trust Gating & Cross-Attention Training
-Train Stage 1 with AdamW, multi-task losses, and per-epoch Centered Kernel Alignment (CKA) tracking:
+Train Stage 1 with AdamW, Cosine Annealing LR scheduling, early stopping, multi-task losses, and per-epoch Centered Kernel Alignment (CKA) tracking. Calibrated for 80–100 epochs with early stopping (patience=15):
 ```bash
-# Variant 1: Early Fusion
-python train_stage1.py --fusion_variant early --stage1_epochs 35
+# Variant 1: Early Fusion (Image + Audio)
+python train_stage1.py --fusion_variant early --stage1_epochs 100 --stage1_patience 15
 
-# Variant 2: Late Fusion
-python train_stage1.py --fusion_variant late --stage1_epochs 35
+# Variant 2: Late Fusion (Image + Audio)
+python train_stage1.py --fusion_variant late --stage1_epochs 100 --stage1_patience 15
+
+# Multimodal with Video (e.g., Image + Video + Audio)
+python train_stage1.py --fusion_variant early --active_modalities image video audio --stage1_epochs 100
 ```
 
 ### 4. Stage 2: Feature Extraction, RCS Balancing & PRDC Evaluation
@@ -65,15 +68,15 @@ python train_stage2.py --fusion_variant late
 ```
 
 ### 5. Stage 3: Classifier Training & Comprehensive Benchmark Evaluation
-Train Stage 3 classifiers and evaluate on the strictly balanced test set across all 4 variants and baselines:
+Train Stage 3 classifiers with Cosine Annealing LR schedule and early stopping (patience=20), evaluating on the strictly balanced test set across all 4 variants and baselines:
 ```bash
-python train_stage3.py --clf_epochs 50
+python train_stage3.py --clf_epochs 100 --clf_patience 20
 ```
 
 ### 6. Full End-to-End Orchestrator
-To run the entire pipeline end-to-end automatically:
+To run the entire pipeline end-to-end automatically with calibrated epoch settings:
 ```bash
-python run_pipeline.py --stage1_epochs 35 --clf_epochs 50 --eta 5.0 --shrinkage_lambda 0.1
+python run_pipeline.py --stage1_epochs 100 --clf_epochs 100 --eta 5.0 --shrinkage_lambda 0.1
 ```
 
 ---
