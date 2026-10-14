@@ -1,0 +1,112 @@
+# Generic Multimodal Dataset Configuration Template
+# Adapt this configuration for ANY multimodal dataset (images, audio, video, text, sensors).
+# No hardcoded dataset dependencies.
+
+dataset_name: MyMultimodalDataset
+manifest: data/my_dataset_manifest.csv     # Path to manifest CSV/JSON with: sample_id, label, split, <modality_columns>
+modalities: [image, text]                 # Any subset of: [image, audio, video, text]
+
+# Ablations per PDF specification:
+fusion_timing: early                      # Options: early | late
+contrastive_placement: both               # Options: modality_only | fused_only | both
+
+# Artificial Imbalance: Set true only for naturally balanced datasets (applied to train split only)
+create_artificial_imbalance: false
+imbalance_ratio: 0.05                     # Ratio of smallest minority class to largest majority class (e.g. 1:20)
+
+# Encoder Architectures (only enabled modalities are constructed)
+encoder:
+  d: 128                                  # Common latent representation dimension
+
+  image:
+    backbone: cnn                         # Options: cnn | resnet18 | resnet50
+    input_size: 224
+    in_channels: 3
+    cnn_depth: 4
+    cnn_width: 64
+    dropout: 0.1
+
+  audio:
+    sample_rate: 16000
+    n_mels: 64
+    n_fft: 1024
+    hop_length: 512
+    cnn_depth: 4
+    cnn_width: 64
+    dropout: 0.1
+
+  video:
+    backbone: cnn
+    max_frames: 16
+    frame_cnn_depth: 3
+    frame_cnn_width: 64
+    temporal_pool: mean                   # Options: mean | max | attention
+    dropout: 0.1
+
+  text:
+    model_name: bert-base-uncased         # Or HuggingFace model, or glove/embedding
+    max_length: 128
+    dropout: 0.1
+    freeze_backbone: true
+
+# Gating Network (softmax trust scores over modalities)
+gating:
+  hidden_dim: 64
+  dropout: 0.1
+
+# Cross-Modal Attention Fusion
+fusion:
+  num_heads: 4                            # Must divide encoder.d
+  num_layers: 2
+  dropout: 0.1
+  ffn_dim: 256
+  late_extra_layers: 2
+  late_extra_dim: 256
+
+# Supervised Contrastive Projection Heads
+projection:
+  proj_dim: 64
+
+# Loss Weights
+loss:
+  w_con_fused: 1.2                        # Supervised contrastive on z_fused
+  w_con_mod: 1.2                          # Supervised contrastive per modality z_m
+  w_cls: 1.0                              # Cross-entropy classification loss
+  w_rec: 1.0                              # Reconstructive MSE loss
+  w_align: 0.0                            # Cross-modal InfoNCE alignment loss (optional)
+  supcon_temperature: 0.07                # SupCon temperature parameter
+  warmup_epochs: 5                        # Warmup epochs for contrastive loss
+
+decoder:
+  hidden_dim: 256
+  num_layers: 2
+
+# Training Parameters
+training:
+  epochs: 50
+  batch_size: 64
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  optimizer: adamw
+  scheduler: cosine
+  use_balanced_sampler: true              # Class-balanced batch sampler so every class has positive pairs
+  seed: 42
+  num_workers: 0
+  pin_memory: false
+
+# Evaluation Settings
+evaluation:
+  knn_k: 5
+  linear_probe_epochs: 20
+  linear_probe_lr: 1.0e-2
+  compute_tsne: true
+  compute_umap: false
+  tsne_perplexity: 30
+
+# Optuna Stage A (Representation Learning Tuning)
+optuna:
+  enabled: false
+  n_trials: 30
+  study_db: sqlite:///results/MyMultimodalDataset/optuna/stage_a.db
+
+results_root: results

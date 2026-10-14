@@ -1,0 +1,139 @@
+# Stage 1 Configuration Schema
+# All hyperparameters must live here; nothing is hard-coded in the pipeline.
+
+# ─── Dataset ──────────────────────────────────────────────────────────────────
+dataset_name: CREMA-D                       # used for results folder naming
+manifest: path/to/manifest.csv             # CSV or JSON manifest file
+modalities: [video, audio]                 # any subset of: video, image, text, audio
+                                            # only samples with ALL enabled modalities are used
+
+# ─── Fusion ───────────────────────────────────────────────────────────────────
+fusion_timing: early                        # "early" | "late"
+                                            # run both as separate experiments
+
+# ─── Contrastive Placement ────────────────────────────────────────────────────
+contrastive_placement: both                 # "modality_only" | "fused_only" | "both"
+                                            # run all 3 as ablation
+
+# ─── Class Imbalance ──────────────────────────────────────────────────────────
+create_artificial_imbalance: false          # set true only for naturally balanced datasets (train split only)
+
+# ─── Encoder Settings ─────────────────────────────────────────────────────────
+encoder:
+  d: 128                                    # shared embedding dimension (output size of every encoder)
+
+  image:
+    cnn_depth: 4                            # number of conv blocks
+    cnn_width: 64                           # base channels
+    dropout: 0.1
+
+  audio:
+    n_mels: 64                              # mel spectrogram bins
+    cnn_depth: 4
+    cnn_width: 64
+    dropout: 0.1
+
+  video:
+    frame_cnn_depth: 3                      # per-frame CNN depth
+    frame_cnn_width: 64
+    temporal_pool: mean                     # "mean" | "max" | "attention"
+    max_frames: 16                          # sample this many frames per clip
+    dropout: 0.1
+
+  text:
+    model_name: bert-base-uncased           # HuggingFace model name, or "glove" / "fasttext"
+    max_length: 128                         # token truncation length
+    dropout: 0.1
+    freeze_backbone: false                  # freeze transformer weights
+
+# ─── Gating ───────────────────────────────────────────────────────────────────
+gating:
+  hidden_dim: 64                            # gating network hidden size
+  dropout: 0.1
+  # skipped automatically when only 1 modality is enabled
+
+# ─── Fusion / Cross-Attention ─────────────────────────────────────────────────
+fusion:
+  num_heads: 4                              # attention heads (must divide encoder.d)
+  num_layers: 2                             # cross-attention layers
+  dropout: 0.1
+  ffn_dim: 256                              # feed-forward expansion
+
+  # Late fusion: extra per-modality processing before cross-attention
+  late_extra_layers: 2                      # MLP layers before fusion (used only when fusion_timing=late)
+  late_extra_dim: 256
+
+# ─── Projection Heads ─────────────────────────────────────────────────────────
+projection:
+  proj_dim: 64                              # projection head output dimension
+
+# ─── Loss Weights ─────────────────────────────────────────────────────────────
+loss:
+  # Contrastive weights are the highest; terms inactive for current placement are 0.
+  w_con_fused: 1.2                          # SupCon on z_fused  (active when placement = fused_only | both)
+  w_con_mod: 1.2                            # SupCon on each z_m (active when placement = modality_only | both)
+  w_cls: 1.0                               # cross-entropy weight
+  w_rec: 1.0                               # MSE reconstruction weight
+  w_align: 0.0                             # cross-modal InfoNCE weight (optional; set 0 to disable)
+
+  supcon_temperature: 0.07                  # SupCon temperature (tuned over 0.03–0.3)
+  warmup_epochs: 5                          # ramp contrastive weights linearly from 0 to target over N epochs
+
+# ─── Decoder / Reconstruction ─────────────────────────────────────────────────
+decoder:
+  # One decoder per modality, from z_fused back to modality space
+  hidden_dim: 256
+  num_layers: 2
+
+# ─── Training ─────────────────────────────────────────────────────────────────
+training:
+  epochs: 50
+  batch_size: 64
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  optimizer: adamw                          # "adam" | "adamw" | "sgd"
+  scheduler: cosine                         # "cosine" | "step" | "none"
+  seed: 42
+  num_workers: 4
+  pin_memory: true
+  use_balanced_sampler: true               # class-balanced batch sampler (required for SupCon)
+
+# ─── Optuna Stage A ───────────────────────────────────────────────────────────
+optuna:
+  enabled: false
+  n_trials: 50
+  n_jobs: 1                                 # parallel trial workers
+  study_db: sqlite:///results/{dataset_name}/optuna/stage_a.db
+  objective: macro_f1                       # "macro_f1" | "silhouette" | "knn_accuracy"
+  pruner: median                            # "median" | "hyperband" | "none"
+  sampler: tpe
+  search_space:
+    d: [64, 128, 256, 512]
+    encoder_depth: [2, 6]                   # range [min, max]
+    encoder_width: [32, 128]
+    gating_hidden: [32, 128]
+    num_heads: [2, 4, 8]
+    num_layers: [1, 4]
+    fusion_dropout: [0.0, 0.4]
+    proj_dim: [32, 128]
+    w_con_fused: [0.5, 5.0]                # log scale
+    w_con_mod: [0.5, 5.0]                  # log scale
+    w_cls: [0.01, 1.0]
+    w_rec: [0.01, 1.0]
+    w_align: [0.0, 0.5]
+    supcon_temperature: [0.03, 0.3]        # log scale
+    lr: [1.0e-5, 1.0e-2]                  # log scale
+    batch_size: [32, 64, 128, 256]
+    weight_decay: [1.0e-6, 1.0e-2]        # log scale
+    epochs: [20, 100]
+
+# ─── Evaluation / Diagnostics ─────────────────────────────────────────────────
+evaluation:
+  knn_k: 5                                  # k for KNN accuracy probe
+  umap_n_neighbors: 15
+  umap_min_dist: 0.1
+  tsne_perplexity: 30
+  log_cka_every_n_epochs: 1               # CKA between z_fused and each z_m
+
+# ─── Output ───────────────────────────────────────────────────────────────────
+results_root: results                       # base results directory

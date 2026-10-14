@@ -1,0 +1,104 @@
+# Example config for CREMA-D dataset (audio + video)
+# Copy and modify for your dataset.
+
+dataset_name: CREMA-D
+manifest: data/crema_d_manifest.csv     # update to your manifest path
+modalities: [video, audio]
+
+fusion_timing: early                    # run as "early" and "late" separately
+contrastive_placement: both            # ablation: modality_only | fused_only | both
+
+create_artificial_imbalance: false
+
+encoder:
+  d: 128
+
+  audio:
+    n_mels: 64
+    cnn_depth: 4
+    cnn_width: 64
+    dropout: 0.1
+
+  video:
+    frame_cnn_depth: 3
+    frame_cnn_width: 64
+    temporal_pool: mean
+    max_frames: 16
+    dropout: 0.1
+
+gating:
+  hidden_dim: 64
+  dropout: 0.1
+
+fusion:
+  num_heads: 4
+  num_layers: 2
+  dropout: 0.1
+  ffn_dim: 256
+  late_extra_layers: 2
+  late_extra_dim: 256
+
+projection:
+  proj_dim: 64
+
+loss:
+  w_con_fused: 1.2
+  w_con_mod: 1.2
+  w_cls: 1.0
+  w_rec: 1.0
+  w_align: 0.0
+  supcon_temperature: 0.07
+  warmup_epochs: 5
+
+decoder:
+  hidden_dim: 256
+  num_layers: 2
+
+training:
+  epochs: 50
+  batch_size: 64
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  optimizer: adamw
+  scheduler: cosine
+  seed: 42
+  num_workers: 4
+  pin_memory: true
+  use_balanced_sampler: true
+
+optuna:
+  enabled: false
+  n_trials: 50
+  n_jobs: 1
+  study_db: sqlite:///results/CREMA-D/optuna/stage_a.db
+  objective: macro_f1
+  pruner: median
+  sampler: tpe
+  search_space:
+    d: [64, 128, 256, 512]
+    encoder_depth: [2, 6]
+    encoder_width: [32, 128]
+    gating_hidden: [32, 128]
+    num_heads: [2, 4, 8]
+    num_layers: [1, 4]
+    fusion_dropout: [0.0, 0.4]
+    proj_dim: [32, 128]
+    w_con_fused: [0.5, 5.0]
+    w_con_mod: [0.5, 5.0]
+    w_cls: [0.01, 1.0]
+    w_rec: [0.01, 1.0]
+    w_align: [0.0, 0.5]
+    supcon_temperature: [0.03, 0.3]
+    lr: [1.0e-5, 1.0e-2]
+    batch_size: [32, 64, 128, 256]
+    weight_decay: [1.0e-6, 1.0e-2]
+    epochs: [20, 100]
+
+evaluation:
+  knn_k: 5
+  umap_n_neighbors: 15
+  umap_min_dist: 0.1
+  tsne_perplexity: 30
+  log_cka_every_n_epochs: 1
+
+results_root: results
